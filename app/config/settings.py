@@ -1,67 +1,111 @@
 import os
-from typing import Dict, List, Optional, Any
-from pydantic import BaseSettings, Field
+from typing import List, Optional, Dict, Any, Union
+from pydantic import Field, BaseModel, field_validator
+from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
+from pathlib import Path
+import re
 
+# Load environment variables from .env file
 load_dotenv()
 
-
-class DatabaseSettings(BaseSettings):
-    """Database connection settings."""
-    url: str = Field(default=os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:postgres@localhost:5432/chat_manager"))
-    pool_size: int = Field(default=int(os.getenv("DB_POOL_SIZE", "5")))
-    max_overflow: int = Field(default=int(os.getenv("DB_MAX_OVERFLOW", "10")))
-    echo: bool = Field(default=os.getenv("DB_ECHO", "False").lower() == "true")
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 
-class RedisSettings(BaseSettings):
-    """Redis connection settings."""
-    url: str = Field(default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    timeout: int = Field(default=int(os.getenv("REDIS_TIMEOUT", "5")))
-    ttl: int = Field(default=int(os.getenv("REDIS_TTL", "3600")))
+class BotSettings(BaseModel):
+    """Bot settings"""
+    TOKEN: str = ""
+    ADMINS: List[int] = []
+    SKIPS: List[int] = []
+    USE_REDIS: bool = False
 
 
-class RabbitMQSettings(BaseSettings):
-    """RabbitMQ connection settings."""
-    url: str = Field(default=os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F"))
-    queue_name: str = Field(default=os.getenv("RABBITMQ_QUEUE", "chat_manager_events"))
-    exchange_name: str = Field(default=os.getenv("RABBITMQ_EXCHANGE", "chat_manager"))
+class APISettings(BaseModel):
+    """API settings"""
+    ENABLED: bool = False
+    HOST: str = "127.0.0.1"
+    PORT: int = 8080
 
 
-class TelegramSettings(BaseSettings):
-    """Telegram bot settings."""
-    token: str = Field(default=os.getenv("TELEGRAM_BOT_TOKEN", ""))
-    admin_ids: List[int] = Field(
-        default_factory=lambda: [
-            int(id) for id in os.getenv("ADMIN_IDS", "").split(",") if id
-        ]
-    )
-    webhook_url: Optional[str] = Field(default=os.getenv("WEBHOOK_URL", None))
-    webhook_path: str = Field(default=os.getenv("WEBHOOK_PATH", "/webhook"))
+class AppSettings(BaseModel):
+    """Application settings"""
+    DEBUG: bool = False
+    BASE_DIR: Path = BASE_DIR
+    PLUGINS_ENABLED: List[str] = ["mute_plugin", "admin_tools", "antispam", "notes", "welcome"]
+    PLUGINS_DIRS: List[Path] = []
+    
+
+class DatabaseSettings(BaseModel):
+    """Database settings"""
+    DATABASE_URL: str = "sqlite:///bot.db"
+    USE_SQLITE: str = "false"
 
 
-class AppSettings(BaseSettings):
-    """Main application settings."""
-    debug: bool = Field(default=os.getenv("DEBUG", "False").lower() == "true")
-    workers: int = Field(default=int(os.getenv("WORKERS", os.cpu_count() or 1)))
-    default_language: str = Field(default=os.getenv("DEFAULT_LANGUAGE", "en"))
-    available_languages: List[str] = Field(
-        default_factory=lambda: os.getenv("AVAILABLE_LANGUAGES", "en,ru").split(",")
-    )
-    plugins_enabled: List[str] = Field(
-        default_factory=lambda: os.getenv("PLUGINS_ENABLED", "").split(",") if os.getenv("PLUGINS_ENABLED") else []
-    )
-    environment: str = Field(default=os.getenv("ENVIRONMENT", "development"))
+class LoggingSettings(BaseModel):
+    """Logging settings"""
+    LOG_LEVEL: str = "INFO"
+    LOG_FILE: Optional[str] = None
 
 
-class Settings(BaseSettings):
-    """Root settings container."""
+class RedisSettings(BaseModel):
+    """Redis settings"""
+    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+    REDIS_PASSWORD: Optional[str] = None
+
+
+class Settings(BaseModel):
+    """Application settings"""
+    bot: BotSettings = BotSettings()
+    api: APISettings = APISettings()
     app: AppSettings = AppSettings()
-    telegram: TelegramSettings = TelegramSettings()
-    database: DatabaseSettings = DatabaseSettings()
+    db: DatabaseSettings = DatabaseSettings()
+    logging: LoggingSettings = LoggingSettings()
     redis: RedisSettings = RedisSettings()
-    rabbitmq: RabbitMQSettings = RabbitMQSettings()
+    DEBUG: bool = False
+    
+    # Special method to handle environment variables
+    @field_validator('*', mode='before')
+    def check_env(cls, v, info):
+        env_val = os.getenv(info.field_name.upper())
+        if env_val is not None:
+            # Handle different types of fields
+            if isinstance(v, bool):
+                return env_val.lower() in ['true', '1', 'yes']
+            elif isinstance(v, int):
+                return int(env_val)
+            elif isinstance(v, list):
+                return env_val.split(',')
+            return env_val
+        return v
 
 
 # Create settings instance
 settings = Settings()
+
+# Update plugin directories to include both built-in and custom plugins
+settings.app.PLUGINS_DIRS = [
+    BASE_DIR / "app" / "plugins",  # Built-in plugins
+    BASE_DIR / "plugins"           # Custom plugins
+]
+
+# Environment variable overrides
+if os.getenv("BOT_TOKEN"):
+    settings.bot.TOKEN = os.getenv("BOT_TOKEN")
+
+if os.getenv("ADMINS"):
+    settings.bot.ADMINS = [int(admin) for admin in os.getenv("ADMINS").split(",") if admin.strip()]
+
+if os.getenv("PLUGINS_ENABLED"):
+    settings.app.PLUGINS_ENABLED = os.getenv("PLUGINS_ENABLED").split(",")
+
+if os.getenv("DATABASE_URL"):
+    settings.db.DATABASE_URL = os.getenv("DATABASE_URL")
+
+if os.getenv("USE_SQLITE"):
+    settings.db.USE_SQLITE = os.getenv("USE_SQLITE").lower()
+
+# Debug mode
+settings.DEBUG = settings.app.DEBUG

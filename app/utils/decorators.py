@@ -1,126 +1,138 @@
-from functools import wraps
-import asyncio
-from typing import Callable, Dict, Any, Optional, List, Union
-import time
+from typing import Callable, Awaitable, Any, List, Union, Dict, Optional
+import functools
 from loguru import logger
 from aiogram import types
-from aiogram.dispatcher.handler import CancelHandler
-from aiogram.utils.exceptions import Throttled
+from aiogram.dispatcher.flags import get_flag
 
-from app.models.user import UserRole
-from app.services.user_service import user_service
+from app.config.settings import settings
 
 
-def admin_required(func):
-    """Decorator to restrict access to admin users only"""
-    @wraps(func)
+def admin_required(func: Callable) -> Callable:
+    """Decorator to check if user is an admin"""
+    @functools.wraps(func)
     async def wrapper(message: types.Message, *args, **kwargs):
-        user = await user_service.get_user_by_telegram_id(message.from_user.id)
+        # Get user data from context (middleware adds this)
+        user_data = kwargs.get('user', {})
+        is_admin = user_data.get('is_admin', False)
         
-        if not user or user.role != UserRole.ADMIN:
-            await message.reply("⚠️ This command is only available to administrators.")
-            return
+        # Check if user is in the admin IDs list from settings
+        admin_ids = settings.ADMIN_IDS
+        user_id = message.from_user.id if message.from_user else None
         
-        return await func(message, *args, **kwargs)
+        if is_admin or (user_id and user_id in admin_ids):
+            return await func(message, *args, **kwargs)
+        else:
+            # Not an admin, inform the user
+            await message.reply("❌ This command is only available to administrators.")
+            return None
+    
+    # Mark handler with flag
+    wrapper.flags = getattr(func, 'flags', {})
+    wrapper.flags['admin_required'] = True
     
     return wrapper
 
 
-def moderator_required(func):
-    """Decorator to restrict access to moderators and admins"""
-    @wraps(func)
+def moderator_required(func: Callable) -> Callable:
+    """Decorator to check if user is a moderator"""
+    @functools.wraps(func)
     async def wrapper(message: types.Message, *args, **kwargs):
-        user = await user_service.get_user_by_telegram_id(message.from_user.id)
+        # Get user data from context (middleware adds this)
+        user_data = kwargs.get('user', {})
+        is_moderator = user_data.get('is_moderator', False)
         
-        if not user or (user.role != UserRole.ADMIN and user.role != UserRole.MODERATOR):
-            await message.reply("⚠️ This command is only available to moderators and administrators.")
-            return
+        # Also count admins from settings as moderators
+        admin_ids = settings.ADMIN_IDS
+        user_id = message.from_user.id if message.from_user else None
         
-        return await func(message, *args, **kwargs)
+        if is_moderator or (user_id and user_id in admin_ids):
+            return await func(message, *args, **kwargs)
+        else:
+            # For group chats, also check if the user is a Telegram admin
+            chat_member_info = kwargs.get('chat_member', {})
+            is_chat_admin = chat_member_info.get('is_admin', False)
+            
+            if is_chat_admin:
+                return await func(message, *args, **kwargs)
+            
+            # Not a moderator, inform the user
+            await message.reply("❌ This command is only available to moderators and administrators.")
+            return None
+    
+    # Mark handler with flag
+    wrapper.flags = getattr(func, 'flags', {})
+    wrapper.flags['moderator_required'] = True
     
     return wrapper
 
 
-def rate_limit(limit: int, key=None):
+def rate_limit(limit: int) -> Callable:
+    """Decorator to limit request rate
+    
+    Args:
+        limit: Maximum number of requests allowed per minute
     """
-    Decorator for rate limiting.
-    :param limit: Maximum number of calls per minute
-    :param key: If None, rate limit is per-function, otherwise per provided key
-    """
-    def decorator(func):
-        # Store last call timestamps per key
-        setattr(func, '_last_call_times', {})
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        async def wrapper(message: types.Message, *args, **kwargs):
+            # The actual rate limiting is handled by RateLimitMiddleware
+            return await func(message, *args, **kwargs)
         
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            last_call_times = getattr(func, '_last_call_times')
-            
-            # Determine the rate limit key
-            if len(args) > 0 and isinstance(args[0], types.Message):
-                # If first arg is a message, use user ID as key
-                rate_key = f"{key or func.__name__}:{args[0].from_user.id}"
-            else:
-                # Otherwise use function name as key
-                rate_key = f"{key or func.__name__}"
-            
-            current_time = time.time()
-            
-            # Clean old timestamps (older than 60 seconds)
-            for k in list(last_call_times.keys()):
-                if current_time - last_call_times[k][-1] > 60:
-                    last_call_times.pop(k, None)
-            
-            # Get call times for this key
-            call_times = last_call_times.get(rate_key, [])
-            
-            # Remove calls older than 60 seconds
-            call_times = [t for t in call_times if current_time - t <= 60]
-            
-            # Check if limit exceeded
-            if len(call_times) >= limit:
-                if isinstance(args[0], types.Message):
-                    await args[0].reply(f"⚠️ Rate limit exceeded. Please wait before using this command again.")
-                return
-            
-            # Add current call time
-            call_times.append(current_time)
-            last_call_times[rate_key] = call_times
-            
-            return await func(*args, **kwargs)
+        # Mark handler with flag for middleware to use
+        wrapper.flags = getattr(func, 'flags', {})
+        wrapper.flags['rate_limit'] = limit
         
         return wrapper
     
     return decorator
 
 
-def log_command(func):
+def log_command(func: Callable) -> Callable:
     """Decorator to log command usage"""
-    @wraps(func)
+    @functools.wraps(func)
     async def wrapper(message: types.Message, *args, **kwargs):
-        logger.info(
-            f"Command: {message.get_command()} | "
-            f"User: {message.from_user.id} ({message.from_user.username or message.from_user.full_name}) | "
-            f"Chat: {message.chat.id} ({message.chat.type})"
-        )
+        # Log command
+        user_id = message.from_user.id if message.from_user else "Unknown"
+        chat_id = message.chat.id if message.chat else "Unknown"
+        chat_type = message.chat.type if message.chat else "Unknown"
+        command = message.text.split()[0] if message.text else "Unknown"
+        
+        logger.info(f"Command {command} used by user {user_id} in chat {chat_id} ({chat_type})")
+        
+        # Call original function
         return await func(message, *args, **kwargs)
     
     return wrapper
 
 
-def chat_type(*chat_types: str):
+def chat_type(*allowed_types: str) -> Callable:
+    """Decorator to restrict commands to specific chat types
+    
+    Args:
+        *allowed_types: Chat types where the command is allowed
+            (e.g. "private", "group", "supergroup")
     """
-    Decorator to restrict handlers to specified chat types
-    E.g. @chat_type("private") or @chat_type("group", "supergroup")
-    """
-    def decorator(func):
-        @wraps(func)
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
         async def wrapper(message: types.Message, *args, **kwargs):
-            if message.chat.type not in chat_types:
-                allowed = ", ".join(chat_types)
-                await message.reply(f"⚠️ This command can only be used in {allowed} chats.")
-                return
+            if not message.chat or message.chat.type not in allowed_types:
+                # Wrong chat type
+                chat_type_str = message.chat.type if message.chat else "Unknown"
+                
+                # Inform user
+                allowed_types_str = ", ".join(allowed_types)
+                await message.reply(
+                    f"❌ This command can only be used in {allowed_types_str} chats.\n"
+                    f"Current chat type: {chat_type_str}"
+                )
+                return None
             
+            # Correct chat type, proceed
             return await func(message, *args, **kwargs)
+        
+        # Mark handler with flag
+        wrapper.flags = getattr(func, 'flags', {})
+        wrapper.flags['allowed_chat_types'] = allowed_types
         
         return wrapper
     

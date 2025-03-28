@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Any, Callable, Type
 from loguru import logger
 import traceback
 from pydantic import BaseModel
+import sys
 
 from app.config.settings import settings
 
@@ -66,10 +67,23 @@ class PluginManager:
         """Initialize the plugin manager"""
         self.plugins: Dict[str, PluginBase] = {}
         self.active_plugins: Dict[str, PluginBase] = {}
+        
+        # Get base directory for the application
+        base_dir = settings.app.BASE_DIR
+        
+        # Define plugin directories
         self.plugin_dirs = [
-            os.path.join(os.path.dirname(__file__), "plugins"),  # Built-in plugins
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "plugins")  # External plugins
+            os.path.join(base_dir, "plugins"),  # External plugins in project root
+            os.path.join(os.path.dirname(__file__), "builtin")  # Built-in plugins
         ]
+        
+        # Ensure plugin directories are in Python path
+        for plugin_dir in self.plugin_dirs:
+            if os.path.exists(plugin_dir) and plugin_dir not in sys.path:
+                sys.path.insert(0, plugin_dir)
+                
+        logger.debug(f"Plugin directories: {self.plugin_dirs}")
+        logger.debug(f"Python path: {sys.path}")
     
     async def discover_plugins(self) -> List[str]:
         """
@@ -102,12 +116,31 @@ class PluginManager:
         plugin_module = None
         plugin_class = None
         
+        # Check each plugin directory
         for plugin_dir in self.plugin_dirs:
-            module_path = f"{plugin_dir}.{plugin_name}"
+            if not os.path.exists(plugin_dir):
+                continue
+            
+            # Check if plugin directory exists
+            plugin_path = os.path.join(plugin_dir, plugin_name)
+            if not os.path.exists(plugin_path) or not os.path.isdir(plugin_path):
+                continue
+            
+            # Check if __init__.py exists in the plugin directory
+            init_file = os.path.join(plugin_path, "__init__.py")
+            if not os.path.exists(init_file):
+                logger.warning(f"Plugin directory exists but missing __init__.py: {plugin_path}")
+                continue
+            
+            # Try to import the module
             try:
-                plugin_module = importlib.import_module(module_path)
+                logger.debug(f"Attempting to import plugin module '{plugin_name}' from {plugin_dir}")
+                # Use relative import if the directory is in sys.path
+                plugin_module = importlib.import_module(plugin_name)
+                logger.debug(f"Successfully imported plugin module '{plugin_name}'")
                 break
-            except ImportError:
+            except ImportError as e:
+                logger.debug(f"Import failed for '{plugin_name}': {e}")
                 continue
         
         if not plugin_module:
@@ -120,6 +153,7 @@ class PluginManager:
                 issubclass(obj, PluginBase) and 
                 obj is not PluginBase):
                 plugin_class = obj
+                logger.debug(f"Found plugin class {name} in module {plugin_name}")
                 break
         
         if not plugin_class:
@@ -239,7 +273,7 @@ class PluginManager:
     
     async def init_plugins(self) -> None:
         """Initialize plugins from settings"""
-        plugins_to_load = settings.app.plugins_enabled
+        plugins_to_load = settings.app.PLUGINS_ENABLED
         
         if not plugins_to_load:
             logger.info("No plugins configured for loading")

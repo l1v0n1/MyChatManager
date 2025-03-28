@@ -4,159 +4,254 @@ from typing import Any, Dict, List, Optional, Union, TypeVar, Generic, Type
 import redis.asyncio as redis
 from loguru import logger
 from pydantic import BaseModel
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 from app.config.settings import settings
 
 T = TypeVar('T')
 
 
+class DummyCache:
+    """In-memory cache for when Redis is not available"""
+    def __init__(self):
+        self.cache = {}
+        self.ttls = {}
+    
+    async def ping(self):
+        return True
+    
+    async def get(self, key):
+        # Check if key exists and hasn't expired
+        now = asyncio.get_event_loop().time()
+        if key in self.cache and (key not in self.ttls or self.ttls[key] > now):
+            return self.cache[key]
+        # Remove expired keys
+        if key in self.ttls and self.ttls[key] <= now:
+            del self.cache[key]
+            del self.ttls[key]
+        return None
+    
+    async def set(self, key, value, ex=None):
+        self.cache[key] = value
+        if ex:
+            self.ttls[key] = asyncio.get_event_loop().time() + ex
+        return True
+    
+    async def delete(self, key):
+        if key in self.cache:
+            del self.cache[key]
+            if key in self.ttls:
+                del self.ttls[key]
+            return 1
+        return 0
+    
+    async def keys(self, pattern):
+        import fnmatch
+        return [k for k in self.cache.keys() if fnmatch.fnmatch(k, pattern)]
+    
+    async def flushdb(self):
+        self.cache.clear()
+        self.ttls.clear()
+        return True
+    
+    async def close(self):
+        pass
+
+
 class CacheService:
-    """Redis-based cache service"""
+    """Service for caching data"""
     
     def __init__(self):
-        """Initialize the cache service"""
-        self._redis: Optional[redis.Redis] = None
-        self._is_connected = False
+        """Initialize cache service"""
+        self.connected = False
+        self.client = None
+        self.in_memory_cache = {}
+        self.in_memory_ttl = {}
     
-    async def connect(self) -> None:
-        """Connect to Redis"""
-        if self._is_connected:
-            return
-            
-        try:
-            self._redis = redis.from_url(
-                settings.redis.url,
-                socket_timeout=settings.redis.timeout,
-                decode_responses=True
-            )
-            await self._redis.ping()
-            self._is_connected = True
-            logger.info(f"Connected to Redis: {settings.redis.url}")
-        except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            self._is_connected = False
+    async def connect(self) -> bool:
+        """Connect to Redis if configured, otherwise use in-memory cache"""
+        if settings.redis.REDIS_URL:
+            try:
+                # Connect to Redis
+                self.client = redis.from_url(
+                    settings.redis.REDIS_URL,
+                    encoding="utf-8",
+                    decode_responses=True
+                )
+                
+                # Test connection
+                await self.client.ping()
+                
+                self.connected = True
+                logger.info(f"Connected to Redis: {settings.redis.REDIS_URL}")
+                return True
+                
+            except Exception as e:
+                logger.warning(f"Failed to connect to Redis: {e}")
+                logger.warning("Using in-memory cache instead")
+                self.client = None
+        
+        # Use in-memory if Redis not available or connection failed
+        if not self.connected:
+            logger.info("Using in-memory cache")
+            self.in_memory_cache = {}
+            self.in_memory_ttl = {}
+            self.connected = True
+        
+        return self.connected
     
     async def disconnect(self) -> None:
         """Disconnect from Redis"""
-        if self._is_connected and self._redis:
-            await self._redis.close()
-            self._is_connected = False
-            logger.info("Disconnected from Redis")
-    
-    async def get(self, key: str) -> Optional[str]:
-        """Get a value from the cache"""
-        if not self._is_connected:
-            await self.connect()
+        if self.client:
+            await self.client.close()
+            self.client = None
         
-        if not self._is_connected:
-            logger.warning("Cannot get from cache: not connected to Redis")
+        self.connected = False
+        logger.info("Disconnected from cache")
+    
+    async def get(self, key: str) -> Any:
+        """Get a value from cache"""
+        if not self.connected:
             return None
         
-        try:
-            return await self._redis.get(key)
-        except Exception as e:
-            logger.error(f"Error getting from cache: {e}")
-            return None
+        # Get from Redis
+        if self.client:
+            try:
+                value = await self.client.get(key)
+                if value is None:
+                    return None
+                
+                try:
+                    # Try to parse as JSON
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    # Return as string if not JSON
+                    return value
+                    
+            except Exception as e:
+                logger.error(f"Error getting key '{key}' from Redis: {e}")
+                return None
+        
+        # Get from in-memory cache
+        if key in self.in_memory_cache:
+            # Check if expired
+            if key in self.in_memory_ttl and self.in_memory_ttl[key] < datetime.now():
+                # Expired - remove and return None
+                del self.in_memory_cache[key]
+                del self.in_memory_ttl[key]
+                return None
+            
+            return self.in_memory_cache[key]
+        
+        return None
     
-    async def set(self, key: str, value: str, ttl: Optional[int] = None) -> bool:
-        """Set a value in the cache"""
-        if not self._is_connected:
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
+        """Set a value in cache
+        
+        Args:
+            key: Cache key
+            value: Value to store (will be JSON serialized)
+            ttl: Time-to-live in seconds
+        """
+        if not self.connected:
             await self.connect()
         
-        if not self._is_connected:
-            logger.warning("Cannot set in cache: not connected to Redis")
-            return False
+        # Convert to JSON string for storage if not a string already
+        if not isinstance(value, (str, int, float, bool)) and value is not None:
+            value_str = json.dumps(value)
+        else:
+            value_str = str(value) if value is not None else None
         
-        try:
-            ttl = ttl or settings.redis.ttl
-            return await self._redis.set(key, value, ex=ttl)
-        except Exception as e:
-            logger.error(f"Error setting in cache: {e}")
-            return False
+        # Store in Redis
+        if self.client:
+            try:
+                if ttl:
+                    await self.client.setex(key, ttl, value_str)
+                else:
+                    await self.client.set(key, value_str)
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error setting key '{key}' in Redis: {e}")
+                return False
+        
+        # Store in in-memory cache
+        self.in_memory_cache[key] = value
+        
+        # Set expiration
+        if ttl:
+            self.in_memory_ttl[key] = datetime.now() + timedelta(seconds=ttl)
+        elif key in self.in_memory_ttl:
+            # Remove TTL if exists but not provided
+            del self.in_memory_ttl[key]
+        
+        return True
     
     async def delete(self, key: str) -> bool:
-        """Delete a value from the cache"""
-        if not self._is_connected:
-            await self.connect()
-        
-        if not self._is_connected:
-            logger.warning("Cannot delete from cache: not connected to Redis")
+        """Delete a key from cache"""
+        if not self.connected:
             return False
         
-        try:
-            return bool(await self._redis.delete(key))
-        except Exception as e:
-            logger.error(f"Error deleting from cache: {e}")
-            return False
-    
-    async def get_json(self, key: str) -> Optional[Dict[str, Any]]:
-        """Get a JSON value from the cache"""
-        value = await self.get(key)
-        if value:
+        # Delete from Redis
+        if self.client:
             try:
-                return json.loads(value)
-            except json.JSONDecodeError as e:
-                logger.error(f"Error decoding JSON from cache: {e}")
-        return None
-    
-    async def set_json(self, key: str, value: Dict[str, Any], ttl: Optional[int] = None) -> bool:
-        """Set a JSON value in the cache"""
-        try:
-            json_value = json.dumps(value)
-            return await self.set(key, json_value, ttl)
-        except Exception as e:
-            logger.error(f"Error encoding JSON for cache: {e}")
-            return False
-    
-    async def get_model(self, key: str, model_cls: Type[T]) -> Optional[T]:
-        """Get a model instance from the cache"""
-        data = await self.get_json(key)
-        if data:
-            try:
-                return model_cls(**data)
+                return await self.client.delete(key) > 0
+                
             except Exception as e:
-                logger.error(f"Error creating model from cache data: {e}")
+                logger.error(f"Error deleting key '{key}' from Redis: {e}")
+                return False
+        
+        # Delete from in-memory cache
+        if key in self.in_memory_cache:
+            del self.in_memory_cache[key]
+            if key in self.in_memory_ttl:
+                del self.in_memory_ttl[key]
+            return True
+        
+        return False
+    
+    async def exists(self, key: str) -> bool:
+        """Check if a key exists in cache"""
+        if not self.connected:
+            return False
+        
+        # Check in Redis
+        if self.client:
+            try:
+                return await self.client.exists(key) > 0
+                
+            except Exception as e:
+                logger.error(f"Error checking key '{key}' in Redis: {e}")
+                return False
+        
+        # Check in in-memory cache
+        return key in self.in_memory_cache and (
+            key not in self.in_memory_ttl or
+            self.in_memory_ttl[key] >= datetime.now()
+        )
+    
+    async def get_ttl(self, key: str) -> Optional[int]:
+        """Get TTL for a key in seconds"""
+        if not self.connected:
+            return None
+        
+        # Get from Redis
+        if self.client:
+            try:
+                ttl = await self.client.ttl(key)
+                return ttl if ttl > 0 else None
+                
+            except Exception as e:
+                logger.error(f"Error getting TTL for key '{key}' from Redis: {e}")
+                return None
+        
+        # Get from in-memory cache
+        if key in self.in_memory_ttl:
+            remaining = (self.in_memory_ttl[key] - datetime.now()).total_seconds()
+            return int(remaining) if remaining > 0 else None
+        
         return None
-    
-    async def set_model(self, key: str, model: BaseModel, ttl: Optional[int] = None) -> bool:
-        """Set a model instance in the cache"""
-        try:
-            return await self.set_json(key, model.dict(), ttl)
-        except Exception as e:
-            logger.error(f"Error serializing model for cache: {e}")
-            return False
-    
-    async def keys(self, pattern: str) -> List[str]:
-        """Get keys matching a pattern"""
-        if not self._is_connected:
-            await self.connect()
-        
-        if not self._is_connected:
-            logger.warning("Cannot get keys from cache: not connected to Redis")
-            return []
-        
-        try:
-            return await self._redis.keys(pattern)
-        except Exception as e:
-            logger.error(f"Error getting keys from cache: {e}")
-            return []
-    
-    async def flush(self) -> bool:
-        """Flush the entire cache"""
-        if not self._is_connected:
-            await self.connect()
-        
-        if not self._is_connected:
-            logger.warning("Cannot flush cache: not connected to Redis")
-            return False
-        
-        try:
-            return bool(await self._redis.flushdb())
-        except Exception as e:
-            logger.error(f"Error flushing cache: {e}")
-            return False
 
 
-# Create singleton instance
+# Create a singleton instance
 cache_service = CacheService()

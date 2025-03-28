@@ -1,123 +1,157 @@
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.contrib.fsm_storage.redis import RedisStorage2
-from aiogram.dispatcher.middlewares import BaseMiddleware
-from aiogram.utils.executor import start_webhook, start_polling
+from typing import Optional, Union, Dict, Any
 import asyncio
 from loguru import logger
-import sys
-from typing import Dict, Any, List, Optional, Union
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 from app.config.settings import settings
 from app.api.handlers import register_handlers
-from app.api.middlewares import UserUpdateMiddleware, ModerationMiddleware, MetricsMiddleware
-from app.services.cache_service import cache_service
-from app.events.event_manager import event_manager
-from app.models.base import init_db
+from app.api.middlewares import (
+    UserContextMiddleware,
+    RateLimitMiddleware,
+    LoggingMiddleware
+)
 
 
-class Bot:
-    """Main bot class"""
+# Global bot instance
+bot: Optional[Bot] = None
+dp: Optional[Dispatcher] = None
+
+
+async def setup_bot() -> Bot:
+    """Initialize and configure the bot"""
+    global bot, dp
     
-    def __init__(self):
-        """Initialize bot"""
-        self.token = settings.telegram.token
-        
-        # Create bot and dispatcher
-        self.bot = Bot(token=self.token, parse_mode=types.ParseMode.HTML)
-        
-        # Choose storage depending on settings
-        if settings.redis.url and not settings.app.debug:
-            # Use Redis for production
-            self.storage = RedisStorage2(
-                host=settings.redis.url.split("://")[1].split(":")[0],
-                port=int(settings.redis.url.split("://")[1].split(":")[1].split("/")[0]),
-                db=int(settings.redis.url.split("://")[1].split("/")[1])
-            )
-            logger.info("Using Redis storage for FSM")
+    # Create storage
+    try:
+        if settings.redis.REDIS_URL:
+            # Try to connect to Redis first
+            import redis.asyncio
+            try:
+                # Test the connection
+                redis_client = redis.asyncio.from_url(settings.redis.REDIS_URL, decode_responses=True)
+                await redis_client.ping()
+                
+                # If successful, use Redis storage
+                storage = RedisStorage.from_url(
+                    url=settings.redis.REDIS_URL,
+                    connection_kwargs={
+                        "decode_responses": True
+                    }
+                )
+                logger.info("Using Redis storage for FSM")
+                await redis_client.close()
+            except Exception as e:
+                logger.warning(f"Failed to connect to Redis: {e}. Using in-memory storage instead.")
+                storage = MemoryStorage()
+                logger.info("Using in-memory storage for FSM")
         else:
-            # Use memory storage for development
-            self.storage = MemoryStorage()
-            logger.info("Using memory storage for FSM")
-        
-        self.dp = Dispatcher(self.bot, storage=self.storage)
-        
-        # Register middlewares
-        self.setup_middlewares()
-        
-        # Register handlers
-        register_handlers(self.dp)
+            storage = MemoryStorage()
+            logger.info("Using in-memory storage for FSM")
+    except Exception as e:
+        logger.error(f"Error configuring storage: {e}")
+        storage = MemoryStorage()
+        logger.info("Fallback to in-memory storage for FSM due to error")
     
-    def setup_middlewares(self):
-        """Set up middlewares"""
-        # Add user update middleware
-        self.dp.middleware.setup(UserUpdateMiddleware())
-        
-        # Add moderation middleware
-        self.dp.middleware.setup(ModerationMiddleware())
-        
-        # Add metrics middleware (if not in debug mode)
-        if not settings.app.debug:
-            self.dp.middleware.setup(MetricsMiddleware())
+    # Create bot instance
+    bot = Bot(
+        token=settings.bot.TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
     
-    async def on_startup(self, dp: Dispatcher):
-        """Startup actions"""
-        logger.info("Starting up...")
-        
-        # Initialize database
-        await init_db()
-        
-        # Connect to Redis for caching
-        await cache_service.connect()
-        
-        # Connect to RabbitMQ for events
-        await event_manager.connect_rabbitmq()
-        
-        # Set webhook if configured
-        if settings.telegram.webhook_url:
-            await self.bot.set_webhook(settings.telegram.webhook_url + settings.telegram.webhook_path)
-            logger.info(f"Webhook set to {settings.telegram.webhook_url + settings.telegram.webhook_path}")
-        
-        logger.info("Bot startup complete")
+    # Create dispatcher
+    dp = Dispatcher(storage=storage)
     
-    async def on_shutdown(self, dp: Dispatcher):
-        """Shutdown actions"""
-        logger.info("Shutting down...")
+    # Register middlewares
+    dp.update.middleware(LoggingMiddleware())
+    dp.update.middleware(UserContextMiddleware())
+    dp.message.middleware(RateLimitMiddleware())
+    
+    # Register core handlers
+    register_handlers(dp)
+    
+    # Initialize plugin manager and register plugin handlers
+    try:
+        from app.plugins.plugin_manager import PluginManager
         
-        # Close webhook if it was set
-        if settings.telegram.webhook_url:
-            await self.bot.delete_webhook()
+        # Create plugin manager
+        plugin_manager = PluginManager()
         
-        # Close Redis connections
-        await cache_service.disconnect()
+        # Initialize plugins
+        await plugin_manager.init_plugins()
         
+        # Register plugin routers if available
+        for plugin_name, plugin in plugin_manager.active_plugins.items():
+            if hasattr(plugin, 'router'):
+                dp.include_router(plugin.router)
+                logger.info(f"Registered router for plugin: {plugin_name}")
+            
+        logger.info(f"Loaded {len(plugin_manager.active_plugins)} plugins: {', '.join(plugin_manager.active_plugins.keys())}")
+    except Exception as e:
+        logger.error(f"Error loading plugins: {e}")
+    
+    # Set commands
+    await setup_bot_commands(bot)
+    
+    return bot
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Setup bot commands in the menu"""
+    from aiogram.types import BotCommand
+    
+    commands = [
+        BotCommand(command="start", description="Start the bot"),
+        BotCommand(command="help", description="Show available commands"),
+        BotCommand(command="rules", description="Show chat rules"),
+        BotCommand(command="report", description="Report a message (reply to it)"),
+    ]
+    
+    await bot.set_my_commands(commands)
+    logger.info("Bot commands have been set")
+
+
+async def start_bot(skip_updates: bool = True) -> None:
+    """Start the bot polling for updates"""
+    global bot, dp
+    
+    if not bot or not dp:
+        bot = await setup_bot()
+    
+    logger.info("Starting bot polling...")
+    
+    try:
+        # Start polling
+        await dp.start_polling(
+            bot,
+            skip_updates=skip_updates,
+            allowed_updates=[
+                "message",
+                "edited_message",
+                "callback_query",
+                "chat_member",
+                "my_chat_member",
+            ],
+        )
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
+        raise
+    finally:
         # Close bot session
-        await self.bot.close()
-        
-        logger.info("Bot shutdown complete")
+        if bot:
+            await bot.session.close()
+
+
+async def stop_bot() -> None:
+    """Stop the bot gracefully"""
+    global bot
     
-    def run(self):
-        """Run the bot"""
-        if settings.telegram.webhook_url:
-            # Webhook mode
-            start_webhook(
-                dispatcher=self.dp,
-                webhook_path=settings.telegram.webhook_path,
-                on_startup=self.on_startup,
-                on_shutdown=self.on_shutdown,
-                skip_updates=True,
-                host='0.0.0.0',
-                port=8443
-            )
-        else:
-            # Polling mode
-            start_polling(
-                dispatcher=self.dp,
-                on_startup=self.on_startup,
-                on_shutdown=self.on_shutdown,
-                skip_updates=True
-            )
-
-
-# Create bot instance
-bot_instance = Bot()
+    logger.info("Stopping bot...")
+    
+    if bot:
+        await bot.session.close()
+        
+    logger.info("Bot stopped")

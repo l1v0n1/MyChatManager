@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Table, DateTime, Enum
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Table, DateTime
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -8,8 +8,9 @@ from typing import List, Optional
 from app.models.base import BaseModel, Base
 
 
-class UserRole(enum.Enum):
-    """User role enumeration"""
+# Define constants for user roles
+class UserRole:
+    """User role constants"""
     ADMIN = "admin"
     MODERATOR = "moderator"
     MEMBER = "member"
@@ -26,7 +27,7 @@ class User(BaseModel):
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
     language_code = Column(String(10), default="en")
-    role = Column(Enum(UserRole), default=UserRole.MEMBER)
+    role = Column(String(20), default=UserRole.MEMBER)
     is_active = Column(Boolean, default=True)
     warnings_count = Column(Integer, default=0)
     is_banned = Column(Boolean, default=False)

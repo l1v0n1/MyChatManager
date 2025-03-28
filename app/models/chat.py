@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Table, DateTime, Enum, Text
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Table, DateTime, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -9,16 +9,18 @@ from app.models.base import BaseModel, Base
 from app.models.user import UserRole
 
 
-class ChatType(enum.Enum):
-    """Chat type enumeration"""
+# Define constants for chat types
+class ChatType:
+    """Chat type constants"""
     PRIVATE = "private"
     GROUP = "group"
     SUPERGROUP = "supergroup"
     CHANNEL = "channel"
 
 
-class ChatMemberStatus(enum.Enum):
-    """Chat member status enumeration"""
+# Define constants for chat member status
+class ChatMemberStatus:
+    """Chat member status constants"""
     CREATOR = "creator"
     ADMINISTRATOR = "administrator"
     MEMBER = "member"
@@ -33,7 +35,7 @@ class Chat(BaseModel):
 
     telegram_id = Column(Integer, unique=True, nullable=False, index=True)
     title = Column(String, nullable=True)
-    chat_type = Column(Enum(ChatType), nullable=False)
+    chat_type = Column(String(20), nullable=False)
     is_active = Column(Boolean, default=True)
     description = Column(Text, nullable=True)
     invite_link = Column(String, nullable=True)
@@ -63,8 +65,8 @@ class ChatMember(BaseModel):
 
     chat_id = Column(Integer, ForeignKey("chats.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    status = Column(Enum(ChatMemberStatus), default=ChatMemberStatus.MEMBER)
-    role = Column(Enum(UserRole), default=UserRole.MEMBER)
+    status = Column(String(20), default=ChatMemberStatus.MEMBER)
+    role = Column(String(20), default=UserRole.MEMBER)
     joined_at = Column(DateTime(timezone=True), server_default=func.now())
     is_active = Column(Boolean, default=True)
     muted_until = Column(DateTime, nullable=True)

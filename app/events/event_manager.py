@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from typing import Dict, List, Any, Callable, Awaitable, Set, Optional
+from typing import Dict, List, Any, Callable, Awaitable, Set, Optional, Union
 from loguru import logger
 import pika
 import json
@@ -18,168 +18,116 @@ class Event(BaseModel):
     data: Dict[str, Any]
     timestamp: datetime = datetime.now()
     event_id: str = str(uuid.uuid4())
+    
+    def json(self) -> str:
+        """Compatibility method for both Pydantic v1 and v2"""
+        if hasattr(self, 'model_dump_json'):
+            return self.model_dump_json()
+        return super().json()
 
 
 class EventManager:
-    """Event manager using observer pattern"""
-    
+    """Event manager for handling internal events"""
     def __init__(self):
-        self._listeners: Dict[str, List[Callable[[Event], Awaitable[None]]]] = {}
-        self._connection = None
-        self._channel = None
-        self._queue_name = settings.rabbitmq.queue_name
-        self._exchange_name = settings.rabbitmq.exchange_name
-        self._is_connected = False
+        """Initialize event manager"""
+        self.events = {}
+        self.connected = False
+        self._queue = asyncio.Queue()
+        self._running = False
+        self._worker_task = None
     
-    async def connect_rabbitmq(self) -> None:
-        """Connect to RabbitMQ"""
-        if self._is_connected:
-            return
-            
-        try:
-            # Create connection parameters
-            connection_params = pika.URLParameters(settings.rabbitmq.url)
-            
-            # Create connection (using blocking connection for simplicity)
-            self._connection = pika.BlockingConnection(connection_params)
-            self._channel = self._connection.channel()
-            
-            # Declare exchange
-            self._channel.exchange_declare(
-                exchange=self._exchange_name,
-                exchange_type='topic',
-                durable=True
-            )
-            
-            # Declare queue
-            self._channel.queue_declare(
-                queue=self._queue_name,
-                durable=True
-            )
-            
-            # Bind queue to exchange
-            self._channel.queue_bind(
-                queue=self._queue_name,
-                exchange=self._exchange_name,
-                routing_key='#'  # All routing keys
-            )
-            
-            self._is_connected = True
-            logger.info(f"Connected to RabbitMQ: {settings.rabbitmq.url}")
+    async def connect(self) -> None:
+        """Connect to event system"""
+        self.connected = True
+        logger.info("Event manager connected")
         
-        except Exception as e:
-            logger.error(f"Failed to connect to RabbitMQ: {e}")
-            self._is_connected = False
+        # Start background task to process events
+        self._running = True
+        self._worker_task = asyncio.create_task(self._process_events())
     
-    def register(self, event_type: str, callback: Callable[[Event], Awaitable[None]]) -> None:
-        """Register an event listener"""
-        if event_type not in self._listeners:
-            self._listeners[event_type] = []
+    async def disconnect(self) -> None:
+        """Disconnect from event system"""
+        self.connected = False
+        self._running = False
         
-        if callback not in self._listeners[event_type]:
-            self._listeners[event_type].append(callback)
-            logger.debug(f"Registered listener for event '{event_type}': {callback.__name__}")
-    
-    def unregister(self, event_type: str, callback: Callable[[Event], Awaitable[None]]) -> None:
-        """Unregister an event listener"""
-        if event_type in self._listeners and callback in self._listeners[event_type]:
-            self._listeners[event_type].remove(callback)
-            logger.debug(f"Unregistered listener for event '{event_type}': {callback.__name__}")
-    
-    async def publish(self, event_type: str, data: Dict[str, Any]) -> None:
-        """Publish an event"""
-        event = Event(event_type=event_type, data=data)
-        
-        # Log the event
-        logger.debug(f"Publishing event: {event_type} ({event.event_id})")
-        
-        # Process locally
-        tasks = []
-        if event_type in self._listeners:
-            for callback in self._listeners[event_type]:
-                task = asyncio.create_task(self._execute_callback(callback, event))
-                tasks.append(task)
-        
-        # Also send to RabbitMQ if connected
-        if self._is_connected:
+        # Wait for worker to finish if it's running
+        if self._worker_task:
             try:
-                self._channel.basic_publish(
-                    exchange=self._exchange_name,
-                    routing_key=event_type,
-                    body=event.json(),
-                    properties=pika.BasicProperties(
-                        delivery_mode=2,  # Make message persistent
-                        content_type='application/json'
-                    )
-                )
+                self._worker_task.cancel()
+                await asyncio.wait_for(self._worker_task, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            
+        logger.info("Event manager disconnected")
+    
+    async def publish(self, event_type: str, data: Dict[str, Any]) -> bool:
+        """Publish an event"""
+        if not self.connected:
+            logger.warning(f"Event manager not connected, can't publish event: {event_type}")
+            return False
+        
+        # Add metadata to event
+        event = {
+            "type": event_type,
+            "timestamp": datetime.utcnow().isoformat(),
+            "data": data
+        }
+        
+        # Add to queue
+        await self._queue.put(event)
+        
+        return True
+    
+    def subscribe(self, event_type: str, callback: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
+        """Subscribe to an event type"""
+        if event_type not in self.events:
+            self.events[event_type] = []
+        
+        self.events[event_type].append(callback)
+        logger.debug(f"Subscribed to event: {event_type}")
+    
+    def unsubscribe(self, event_type: str, callback: Callable[[Dict[str, Any]], Awaitable[None]]) -> bool:
+        """Unsubscribe from an event type"""
+        if event_type not in self.events:
+            return False
+        
+        if callback in self.events[event_type]:
+            self.events[event_type].remove(callback)
+            logger.debug(f"Unsubscribed from event: {event_type}")
+            return True
+        
+        return False
+    
+    async def _process_events(self) -> None:
+        """Background task to process events from queue"""
+        logger.info("Event processor started")
+        
+        while self._running:
+            try:
+                # Get event from queue (with timeout to allow checking _running flag)
+                try:
+                    event = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                
+                event_type = event.get("type")
+                
+                # Check if anyone is subscribed to this event
+                if event_type in self.events and self.events[event_type]:
+                    # Call all subscribers
+                    for callback in self.events[event_type]:
+                        try:
+                            await callback(event)
+                        except Exception as e:
+                            logger.error(f"Error in event subscriber for {event_type}: {e}")
+                
+                # Mark task as done
+                self._queue.task_done()
+                
             except Exception as e:
-                logger.error(f"Failed to publish event to RabbitMQ: {e}")
+                logger.error(f"Error processing event: {e}")
         
-        if tasks:
-            await asyncio.gather(*tasks)
-    
-    async def _execute_callback(self, callback: Callable[[Event], Awaitable[None]], event: Event) -> None:
-        """Execute callback safely"""
-        try:
-            await callback(event)
-        except Exception as e:
-            logger.error(f"Error in event listener {callback.__name__} for event {event.event_type}: {e}")
-    
-    async def start_consuming(self) -> None:
-        """Start consuming messages from RabbitMQ"""
-        if not self._is_connected:
-            await self.connect_rabbitmq()
-        
-        if not self._is_connected:
-            logger.error("Cannot start consuming: not connected to RabbitMQ")
-            return
-        
-        try:
-            # Set up basic consume with callback
-            self._channel.basic_consume(
-                queue=self._queue_name,
-                on_message_callback=self._process_message,
-                auto_ack=False
-            )
-            
-            logger.info(f"Started consuming from queue: {self._queue_name}")
-            
-            # Start consuming (blocking call)
-            self._channel.start_consuming()
-        
-        except Exception as e:
-            logger.error(f"Error in RabbitMQ consumer: {e}")
-    
-    def _process_message(self, ch, method, properties, body) -> None:
-        """Process message from RabbitMQ"""
-        try:
-            # Parse event
-            event_data = json.loads(body)
-            event = Event(**event_data)
-            
-            # Create asyncio task for processing
-            asyncio.create_task(self._process_event(event))
-            
-            # Acknowledge the message
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            
-        except Exception as e:
-            logger.error(f"Error processing message from RabbitMQ: {e}")
-            # Negative acknowledge on error
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-    
-    async def _process_event(self, event: Event) -> None:
-        """Process event from RabbitMQ"""
-        logger.debug(f"Processing event from queue: {event.event_type} ({event.event_id})")
-        
-        if event.event_type in self._listeners:
-            tasks = []
-            for callback in self._listeners[event.event_type]:
-                task = asyncio.create_task(self._execute_callback(callback, event))
-                tasks.append(task)
-            
-            if tasks:
-                await asyncio.gather(*tasks)
+        logger.info("Event processor stopped")
 
 
 # Create a singleton instance
@@ -194,7 +142,7 @@ def event_listener(event_type: str):
             return await func(*args, **kwargs)
         
         # Register the function as a listener
-        event_manager.register(event_type, func)
+        event_manager.subscribe(event_type, func)
         return wrapper
     
     return decorator

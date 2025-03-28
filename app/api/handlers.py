@@ -1,7 +1,8 @@
-from aiogram import types, Dispatcher
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.utils.markdown import hbold, hcode, hitalic, hlink, hstrikethrough, hunderline
+from aiogram import types, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from loguru import logger
 from typing import Dict, List, Any, Optional, Union
 import asyncio
@@ -16,6 +17,12 @@ from app.models.chat import Chat, ChatMember, ChatMemberStatus
 from app.utils.decorators import admin_required, moderator_required, rate_limit, log_command, chat_type
 
 
+# Create routers for different command groups
+main_router = Router(name="main")
+admin_router = Router(name="admin")
+moderator_router = Router(name="moderator")
+
+
 # State machine for user input
 class ModeratorActions(StatesGroup):
     waiting_for_ban_reason = State()
@@ -26,8 +33,9 @@ class ModeratorActions(StatesGroup):
 
 
 # Command handlers
+@main_router.message(Command("start"))
 @log_command
-async def cmd_start(message: types.Message):
+async def cmd_start(message: Message):
     """Handle /start command"""
     await message.reply(
         f"👋 Welcome to the Chat Manager Bot!\n\n"
@@ -36,55 +44,99 @@ async def cmd_start(message: types.Message):
     )
 
 
+@main_router.message(Command("help"))
 @log_command
-async def cmd_help(message: types.Message):
+async def cmd_help(message: Message, **kwargs):
     """Handle /help command"""
     # Get user from context data (added by middleware)
-    user_data = message.bot.get('user', {})
+    user_data = kwargs.get('user', {})
     user_role = user_data.get('role', UserRole.MEMBER)
     
     # Basic commands for all users
     help_text = (
-        f"📚 {hbold('Available Commands')}\n\n"
-        f"General commands:\n"
-        f"• /start - Start the bot\n"
-        f"• /help - Show this help message\n"
-        f"• /rules - Show chat rules\n"
+        f"<b>📋 Available Commands</b>\n\n"
+        f"<b>General Commands:</b>\n"
+        f"• /start - Start the bot and get welcome message\n"
+        f"• /help - Show this help message with all commands\n"
+        f"• /rules - Show chat rules and guidelines\n"
         f"• /report - Report a message (reply to it)\n"
+        f"• /feedback - Send feedback about the bot\n"
+        f"• /language - Set your preferred language\n"
+    )
+    
+    # Commands for members in groups
+    help_text += (
+        f"\n<b>Group Member Commands:</b>\n"
+        f"• /me - Show your profile information\n"
+        f"• /stats - Show your activity statistics\n"
+        f"• /points - Show your earned points\n"
+        f"• /link - Get invite link for this chat\n"
     )
     
     # Commands for moderators and admins
     if user_role in [UserRole.MODERATOR, UserRole.ADMIN]:
         help_text += (
-            f"\n{hbold('Moderator Commands')}:\n"
-            f"• /warn - Warn a user (reply to their message)\n"
-            f"• /mute - Temporarily mute a user\n"
+            f"\n<b>Moderator Commands:</b>\n"
+            f"• /warn [reason] - Warn a user (reply to their message)\n"
+            f"• /unwarn - Remove a warning from a user\n"
+            f"• /mute [duration] - Temporarily mute a user\n"
             f"• /unmute - Unmute a user\n"
-            f"• /kick - Remove user from chat\n"
+            f"• /kick [reason] - Remove user from chat\n"
+            f"• /restrict - Restrict user permissions\n"
+            f"• /unrestrict - Restore user permissions\n"
+            f"• /notes - Manage saved notes\n"
+            f"• /pin - Pin a message to the chat\n"
+            f"• /unpin - Unpin a message\n"
         )
     
     # Commands for admins only
     if user_role == UserRole.ADMIN:
         help_text += (
-            f"\n{hbold('Admin Commands')}:\n"
-            f"• /ban - Ban a user permanently\n"
+            f"\n<b>Admin Commands:</b>\n"
+            f"• /ban [reason] - Ban a user permanently\n"
             f"• /unban - Remove a ban\n"
             f"• /promote - Promote user to moderator\n"
             f"• /demote - Demote moderator to regular user\n"
             f"• /settings - Configure chat settings\n"
+            f"• /filter - Add a word filter\n"
+            f"• /unfilter - Remove a word filter\n"
+            f"• /welcome - Set welcome message\n"
+            f"• /goodbye - Set goodbye message\n"
+            f"• /purge - Delete multiple messages\n"
+            f"• /stats_chat - Show chat statistics\n"
+            f"• /backup - Backup chat settings\n"
+            f"• /restore - Restore chat settings\n"
         )
     
-    await message.reply(help_text, parse_mode=types.ParseMode.HTML)
+        # Advanced admin commands
+        help_text += (
+            f"\n<b>Advanced Admin Commands:</b>\n"
+            f"• /broadcast - Send message to all chats\n"
+            f"• /maintenance - Toggle maintenance mode\n"
+            f"• /logs - Get recent logs\n" 
+            f"• /reload - Reload bot configuration\n"
+            f"• /plugins - Manage enabled plugins\n"
+        )
+    
+    # Add information about extending the bot
+    help_text += (
+        f"\n<b>ℹ️ Extending the Bot</b>\n"
+        f"This bot supports plugins to add custom commands.\n"
+        f"Admins can use /plugins to enable or disable plugins."
+    )
+    
+    await message.reply(help_text)
 
 
+@main_router.message(Command("rules"))
 @log_command
 @chat_type("group", "supergroup")
-async def cmd_rules(message: types.Message):
+async def cmd_rules(message: Message):
     """Handle /rules command"""
     # In a real implementation, this would fetch rules from the database
     # Here we'll use placeholder text
     rules_text = (
-        f"📜 {hbold('Chat Rules')}\n\n"
+        f"<b>Chat Rules</b>\n\n"
         f"1. Be respectful to all members\n"
         f"2. No spam or flooding\n" 
         f"3. No offensive content\n"
@@ -93,13 +145,14 @@ async def cmd_rules(message: types.Message):
         f"Violating these rules may result in warnings or bans."
     )
     
-    await message.reply(rules_text, parse_mode=types.ParseMode.HTML)
+    await message.reply(rules_text)
 
 
+@main_router.message(Command("report"))
 @log_command
 @chat_type("group", "supergroup")
 @rate_limit(3)
-async def cmd_report(message: types.Message):
+async def cmd_report(message: Message):
     """Handle /report command"""
     # Check if message is a reply
     if not message.reply_to_message:
@@ -132,10 +185,11 @@ async def cmd_report(message: types.Message):
     })
 
 
+@moderator_router.message(Command("warn"))
 @log_command
 @chat_type("group", "supergroup")
 @moderator_required
-async def cmd_warn(message: types.Message, state: FSMContext):
+async def cmd_warn(message: Message, state: FSMContext):
     """Handle /warn command"""
     # Check if message is a reply
     if not message.reply_to_message:
@@ -151,13 +205,14 @@ async def cmd_warn(message: types.Message, state: FSMContext):
     await message.reply(f"Please provide a reason for warning {target_user.full_name}:")
     
     # Set state to waiting for reason
-    await ModeratorActions.waiting_for_warning_reason.set()
+    await state.set_state(ModeratorActions.waiting_for_warning_reason)
 
 
+@moderator_router.message(ModeratorActions.waiting_for_warning_reason)
 @log_command
 @chat_type("group", "supergroup")
 @moderator_required
-async def process_warning_reason(message: types.Message, state: FSMContext):
+async def process_warning_reason(message: Message, state: FSMContext):
     """Process warning reason"""
     # Get data from state
     data = await state.get_data()
@@ -166,7 +221,7 @@ async def process_warning_reason(message: types.Message, state: FSMContext):
     reason = message.text
     
     # Reset state
-    await state.finish()
+    await state.clear()
     
     if not target_user_id:
         await message.reply("⚠️ Error: Could not find target user information.")
@@ -200,10 +255,11 @@ async def process_warning_reason(message: types.Message, state: FSMContext):
         await message.reply(f"❌ Failed to warn user: {warning_result.get('message', 'Unknown error')}")
 
 
+@moderator_router.message(Command("mute"))
 @log_command
 @chat_type("group", "supergroup")
 @moderator_required
-async def cmd_mute(message: types.Message, state: FSMContext):
+async def cmd_mute(message: Message, state: FSMContext):
     """Handle /mute command"""
     # Check if message is a reply
     if not message.reply_to_message:
@@ -222,11 +278,12 @@ async def cmd_mute(message: types.Message, state: FSMContext):
     )
     
     # Set state to waiting for mute time
-    await ModeratorActions.waiting_for_mute_time.set()
+    await state.set_state(ModeratorActions.waiting_for_mute_time)
 
 
+@moderator_router.message(ModeratorActions.waiting_for_mute_time)
 @log_command
-async def process_mute_time(message: types.Message, state: FSMContext):
+async def process_mute_time(message: Message, state: FSMContext):
     """Process mute time"""
     # Parse duration from text
     time_text = message.text.lower().strip()
@@ -263,17 +320,17 @@ async def process_mute_time(message: types.Message, state: FSMContext):
     
     except ValueError:
         await message.reply("⚠️ Invalid time format. Please use format like: 1h, 30m, 1d, etc.")
-        await state.finish()
+        await state.clear()
         return
     
     if seconds < 30:
         await message.reply("⚠️ Minimum mute duration is 30 seconds.")
-        await state.finish()
+        await state.clear()
         return
     
     if seconds > 86400 * 30:  # 30 days
         await message.reply("⚠️ Maximum mute duration is 30 days.")
-        await state.finish()
+        await state.clear()
         return
     
     # Update state with mute duration
@@ -290,11 +347,12 @@ async def process_mute_time(message: types.Message, state: FSMContext):
     await message.reply(f"Please provide a reason for muting the user for {duration_str}:")
     
     # Set state to waiting for reason
-    await ModeratorActions.waiting_for_mute_reason.set()
+    await state.set_state(ModeratorActions.waiting_for_mute_reason)
 
 
+@moderator_router.message(ModeratorActions.waiting_for_mute_reason)
 @log_command
-async def process_mute_reason(message: types.Message, state: FSMContext):
+async def process_mute_reason(message: Message, state: FSMContext):
     """Process mute reason and apply mute"""
     # Get data from state
     data = await state.get_data()
@@ -303,7 +361,7 @@ async def process_mute_reason(message: types.Message, state: FSMContext):
     reason = message.text
     
     # Reset state
-    await state.finish()
+    await state.clear()
     
     if not target_user_id:
         await message.reply("⚠️ Error: Could not find target user information.")
@@ -317,9 +375,11 @@ async def process_mute_reason(message: types.Message, state: FSMContext):
     
     try:
         # Restrict user's permissions
+        from aiogram.types import ChatPermissions
+        
         await message.chat.restrict(
             user_id=target_user_id,
-            permissions=types.ChatPermissions(
+            permissions=ChatPermissions(
                 can_send_messages=False,
                 can_send_media_messages=False,
                 can_send_other_messages=False,
@@ -349,10 +409,11 @@ async def process_mute_reason(message: types.Message, state: FSMContext):
         await message.reply(f"❌ Failed to mute user: {str(e)}")
 
 
+@moderator_router.message(Command("unmute"))
 @log_command
 @chat_type("group", "supergroup")
 @moderator_required
-async def cmd_unmute(message: types.Message):
+async def cmd_unmute(message: Message):
     """Handle /unmute command"""
     # Check if message is a reply
     if not message.reply_to_message:
@@ -363,9 +424,11 @@ async def cmd_unmute(message: types.Message):
     
     try:
         # Restore user's permissions
+        from aiogram.types import ChatPermissions
+        
         await message.chat.restrict(
             user_id=target_user.id,
-            permissions=types.ChatPermissions(
+            permissions=ChatPermissions(
                 can_send_messages=True,
                 can_send_media_messages=True,
                 can_send_other_messages=True,
@@ -387,10 +450,11 @@ async def cmd_unmute(message: types.Message):
         await message.reply(f"❌ Failed to unmute user: {str(e)}")
 
 
+@admin_router.message(Command("ban"))
 @log_command
 @chat_type("group", "supergroup")
 @admin_required
-async def cmd_ban(message: types.Message, state: FSMContext):
+async def cmd_ban(message: Message, state: FSMContext):
     """Handle /ban command"""
     # Check if message is a reply
     if not message.reply_to_message:
@@ -406,11 +470,12 @@ async def cmd_ban(message: types.Message, state: FSMContext):
     await message.reply(f"Please provide a reason for banning {target_user.full_name}:")
     
     # Set state to waiting for reason
-    await ModeratorActions.waiting_for_ban_reason.set()
+    await state.set_state(ModeratorActions.waiting_for_ban_reason)
 
 
+@admin_router.message(ModeratorActions.waiting_for_ban_reason)
 @log_command
-async def process_ban_reason(message: types.Message, state: FSMContext):
+async def process_ban_reason(message: Message, state: FSMContext):
     """Process ban reason and apply ban"""
     # Get data from state
     data = await state.get_data()
@@ -418,7 +483,7 @@ async def process_ban_reason(message: types.Message, state: FSMContext):
     reason = message.text
     
     # Reset state
-    await state.finish()
+    await state.clear()
     
     if not target_user_id:
         await message.reply("⚠️ Error: Could not find target user information.")
@@ -426,7 +491,7 @@ async def process_ban_reason(message: types.Message, state: FSMContext):
     
     try:
         # Ban user from chat
-        await message.chat.kick(user_id=target_user_id)
+        await message.chat.ban(user_id=target_user_id)
         
         # Get user from database
         target_user = await user_service.get_user_by_telegram_id(target_user_id)
@@ -452,24 +517,11 @@ async def process_ban_reason(message: types.Message, state: FSMContext):
 
 # Register all handlers
 def register_handlers(dp: Dispatcher):
-    """Register all message handlers"""
-    # Basic commands
-    dp.register_message_handler(cmd_start, commands=["start"])
-    dp.register_message_handler(cmd_help, commands=["help"])
-    dp.register_message_handler(cmd_rules, commands=["rules"])
-    dp.register_message_handler(cmd_report, commands=["report"])
-    
-    # Moderation commands
-    dp.register_message_handler(cmd_warn, commands=["warn"])
-    dp.register_message_handler(cmd_mute, commands=["mute"])
-    dp.register_message_handler(cmd_unmute, commands=["unmute"])
-    dp.register_message_handler(cmd_ban, commands=["ban"])
-    
-    # State handlers
-    dp.register_message_handler(process_warning_reason, state=ModeratorActions.waiting_for_warning_reason)
-    dp.register_message_handler(process_mute_time, state=ModeratorActions.waiting_for_mute_time)
-    dp.register_message_handler(process_mute_reason, state=ModeratorActions.waiting_for_mute_reason)
-    dp.register_message_handler(process_ban_reason, state=ModeratorActions.waiting_for_ban_reason)
+    """Register all message handlers with the dispatcher"""
+    # Include all routers
+    dp.include_router(main_router)
+    dp.include_router(moderator_router)
+    dp.include_router(admin_router)
 
 
 # Helper function to format duration
